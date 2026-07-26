@@ -104,16 +104,24 @@ def start_session(label: FaultLabel):
     if db is None:
         raise HTTPException(status_code=503, detail="Firebase not configured")
 
-    docs = (
-        db.collection("computed_stats")
-        .where("label", "==", label)
-        .order_by("trial", direction=firestore.Query.DESCENDING)
-        .limit(1)
-        .stream()
-    )
-    max_trial = 0
-    for doc in docs:
-        max_trial = doc.to_dict().get("trial", 0)
+    try:
+        docs = (
+            db.collection("computed_stats")
+            .where("label", "==", label)
+            .order_by("trial", direction=firestore.Query.DESCENDING)
+            .limit(1)
+            .stream()
+        )
+        max_trial = 0
+        for doc in docs:
+            max_trial = doc.to_dict().get("trial", 0)
+    except Exception as e:
+        # Most likely cause: this query needs a Firestore composite index that
+        # doesn't exist yet. Firestore's own exception message includes a direct
+        # link to auto-create it -- surface that here instead of letting this
+        # raise unhandled (which drops CORS headers and shows as a generic
+        # "Failed to fetch" in the browser instead of this actual message).
+        raise HTTPException(status_code=500, detail=f"Firestore query failed (check for a missing composite index): {e}")
 
     _current_session = {"label": label, "trial": max_trial + 1}
     db.collection("session").document("current").set({
