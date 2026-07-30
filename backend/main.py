@@ -1,35 +1,32 @@
 """
 Motor vibration monitoring backend (Phase 1: no RF model yet).
-Receives raw ADXL335 batches from ESP32, computes FFT + time-domain features,
-stores to Firestore, and serves the dashboard.
+Backed by TimescaleDB (PostgreSQL) with multi-device support so several ESP32
+units can stream concurrently (e.g. simulating multiple motors in a factory).
 
 Endpoints:
-  POST /session/start  - mark the start of a labeled recording session (call this
-                          BEFORE running the motor with a given bearing/condition)
-  GET  /session/current - what label/trial is currently active
-  POST /ingest          - ESP32 posts a batch here (auto-tagged with current session)
-  GET  /latest          - dashboard polls this for current reading + spectrum
-  GET  /history         - dashboard polls this for RMS trend
-  GET  /                - health check
+  POST /session/start    - mark start of a labeled recording session for ONE device
+  GET  /session/current  - current label/trial for one device
+  POST /ingest            - ESP32 posts a batch here (must include device_id)
+  GET  /latest             - latest reading for one device
+  GET  /history            - RMS trend for one device
+  GET  /devices            - list all device_ids seen so far
+  GET  /                   - health check
 """
 
-import json
 import os
-from datetime import datetime, timezone
 from typing import List, Literal
 
-import firebase_admin
 import numpy as np
+import psycopg2
+import psycopg2.extras
+import psycopg2.pool
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from firebase_admin import credentials, firestore
 from pydantic import BaseModel
 from scipy.stats import kurtosis, skew
 
 app = FastAPI(title="Motor Vibration Monitor")
 
-# CORS: allow the dashboard to call this API. Tighten allow_origins to your
-# actual Vercel domain once deployed instead of "*".
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -37,27 +34,30 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# --- Firebase init ---
-# Set env var FIREBASE_CREDENTIALS on Render to the full contents of your
-# service account JSON key (as a single-line string).
-_cred_json = os.environ.get("FIREBASE_CREDENTIALS")
-if _cred_json:
-    cred = credentials.Certificate(json.loads(_cred_json))
-    firebase_admin.initialize_app(cred)
-    db = firestore.client()
-else:
-    db = None  # allows the app to boot locally without Firebase for a quick syntax check
+# Set env var DATABASE_URL on Render to your Timescale Cloud connection string,
+# e.g. postgresql://user:pass@host:port/dbname?sslmode=require
+DATABASE_URL = os.environ.get("DATABASE_URL")
+db_pool = psycopg2.pool.SimpleConnectionPool(1, 10, DATABASE_URL) if DATABASE_URL else None
 
-# Current recording session (label + trial), attached to every ingested batch.
-# Kept in memory for speed (no Firestore read per /ingest call); if the backend
-# restarts mid-session this resets to "unlabeled" -- the dashboard shows the
-# current label prominently so a silent reset is easy to notice, rather than
-# silently mislabeling data.
 FaultLabel = Literal["normal", "bpfo", "bpfi", "ftf", "bsf", "monitoring"]
-_current_session = {"label": "unlabeled", "trial": 0}
+
+# ADXL335 calibration: converts raw ESP32 ADC counts (0-4095, 12-bit) to g.
+# Nominal values from the ADXL335 datasheet at 3.3V supply -- approximate, not
+# lab-calibrated per unit (manufacturing tolerance + ESP32 ADC nonlinearity mean
+# this is good for relative comparison, not instrument-grade absolute accuracy).
+ADC_MAX = 4095
+ADC_VREF = 3.3
+SENSITIVITY_V_PER_G = 0.33
+ADC_TO_G = (ADC_VREF / ADC_MAX) / SENSITIVITY_V_PER_G
+
+# Per-device current recording session (label + trial), kept in memory for speed.
+# Keyed by device_id -- multiple ESP32 units can each be in a different state at
+# the same time (e.g. motor 1 = normal, motor 2 = bpfo, tested concurrently).
+_current_sessions = {}
 
 
 class Batch(BaseModel):
+    device_id: str
     x: List[int]
     y: List[int]
     z: List[int]
@@ -65,7 +65,7 @@ class Batch(BaseModel):
 
 
 def compute_fft(signal, fs):
-    sig = np.array(signal, dtype=float)
+    sig = np.array(signal, dtype=float) * ADC_TO_G
     sig = sig - np.mean(sig)
     window = np.hanning(len(sig))
     windowed = sig * window
@@ -76,134 +76,180 @@ def compute_fft(signal, fs):
 
 
 def compute_features(signal):
-    sig = np.array(signal, dtype=float)
+    sig = np.array(signal, dtype=float) * ADC_TO_G  # ADC counts -> g
     sig_ac = sig - np.mean(sig)
     rms = float(np.sqrt(np.mean(sig_ac ** 2)))
     peak = float(np.max(np.abs(sig_ac)))
     crest = peak / rms if rms > 0 else 0.0
     return {
-        "rms": rms,
-        "crest_factor": crest,
-        "kurtosis": float(kurtosis(sig_ac)),
-        "skewness": float(skew(sig_ac)),
+        "rms": rms,  # g
+        "crest_factor": crest,  # dimensionless (scale-invariant, unaffected by calibration)
+        "kurtosis": float(kurtosis(sig_ac)),  # dimensionless
+        "skewness": float(skew(sig_ac)),  # dimensionless
     }
+
+
+def get_conn():
+    if db_pool is None:
+        raise HTTPException(status_code=503, detail="Database not configured")
+    return db_pool.getconn()
 
 
 @app.get("/")
 def root():
-    return {"status": "backend running", "firebase_connected": db is not None}
+    return {"status": "backend running", "db_connected": db_pool is not None}
 
 
 @app.post("/session/start")
-def start_session(label: FaultLabel):
-    """Call this BEFORE running the motor for a given condition, e.g. right after
-    installing the BPFO-damaged bearing and before switching the motor on.
-    Trial number auto-increments per label based on what's already stored in
-    Firestore, so a backend restart never collides with an existing trial."""
-    global _current_session
-    if db is None:
-        raise HTTPException(status_code=503, detail="Firebase not configured")
-
+def start_session(device_id: str, label: FaultLabel):
+    conn = get_conn()
     try:
-        docs = (
-            db.collection("computed_stats")
-            .where("label", "==", label)
-            .order_by("trial", direction=firestore.Query.DESCENDING)
-            .limit(1)
-            .stream()
-        )
-        max_trial = 0
-        for doc in docs:
-            max_trial = doc.to_dict().get("trial", 0)
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT COALESCE(MAX(trial), 0) FROM readings WHERE device_id = %s AND label = %s",
+                (device_id, label),
+            )
+            max_trial = cur.fetchone()[0]
     except Exception as e:
-        # Most likely cause: this query needs a Firestore composite index that
-        # doesn't exist yet. Firestore's own exception message includes a direct
-        # link to auto-create it -- surface that here instead of letting this
-        # raise unhandled (which drops CORS headers and shows as a generic
-        # "Failed to fetch" in the browser instead of this actual message).
-        raise HTTPException(status_code=500, detail=f"Firestore query failed (check for a missing composite index): {e}")
+        raise HTTPException(status_code=500, detail=f"Database query failed (check for a missing index/table): {e}")
+    finally:
+        db_pool.putconn(conn)
 
-    _current_session = {"label": label, "trial": max_trial + 1}
-    db.collection("session").document("current").set({
-        **_current_session,
-        "started_at": datetime.now(timezone.utc),
-    })
-    return {"status": "ok", **_current_session}
+    _current_sessions[device_id] = {"label": label, "trial": max_trial + 1}
+    return {"status": "ok", "device_id": device_id, **_current_sessions[device_id]}
 
 
 @app.get("/session/current")
-def get_current_session():
-    return _current_session
+def get_current_session(device_id: str):
+    return _current_sessions.get(device_id, {"label": "unlabeled", "trial": 0})
 
 
 @app.post("/ingest")
 def ingest(batch: Batch):
-    if db is None:
-        raise HTTPException(status_code=503, detail="Firebase not configured")
+    session = _current_sessions.get(batch.device_id, {"label": "unlabeled", "trial": 0})
 
-    timestamp = datetime.now(timezone.utc)
-    label = _current_session["label"]
-    trial = _current_session["trial"]
-
-    # 1) store raw batch (kept for future sensor-swap / reprocessing flexibility)
-    db.collection("raw_batches").add({
-        "x": batch.x, "y": batch.y, "z": batch.z,
-        "sample_rate": batch.sample_rate,
-        "timestamp": timestamp,
-        "label": label,
-        "trial": trial,
-    })
-
-    # 2) compute features + spectrum per axis
-    reading = {"timestamp": timestamp, "sample_rate": batch.sample_rate, "label": label, "trial": trial}
-    stats_row = {"timestamp": timestamp, "label": label, "trial": trial}
+    feats = {}
     for axis, data in [("x", batch.x), ("y", batch.y), ("z", batch.z)]:
-        feats = compute_features(data)
+        f = compute_features(data)
         freqs, mag = compute_fft(data, batch.sample_rate)
-        reading[axis] = {"raw": data, **feats, "spectrum_freqs": freqs, "spectrum_mag": mag}
-        stats_row[f"rms_{axis}"] = feats["rms"]
+        feats[axis] = {**f, "freqs": freqs, "mag": mag}
 
-    # "latest/reading" is a single doc, overwritten every ingest -- dashboard reads this
-    db.collection("latest").document("reading").set(reading)
+    conn = get_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO readings (
+                    device_id, label, trial, sample_rate, x_raw, y_raw, z_raw,
+                    x_rms, x_crest, x_kurtosis, x_skewness, x_spectrum_freqs, x_spectrum_mag,
+                    y_rms, y_crest, y_kurtosis, y_skewness, y_spectrum_freqs, y_spectrum_mag,
+                    z_rms, z_crest, z_kurtosis, z_skewness, z_spectrum_freqs, z_spectrum_mag
+                ) VALUES (%s, %s, %s, %s, %s, %s, %s,
+                          %s, %s, %s, %s, %s, %s,
+                          %s, %s, %s, %s, %s, %s,
+                          %s, %s, %s, %s, %s, %s)
+                """,
+                (
+                    batch.device_id, session["label"], session["trial"], batch.sample_rate,
+                    batch.x, batch.y, batch.z,
+                    feats["x"]["rms"], feats["x"]["crest_factor"], feats["x"]["kurtosis"], feats["x"]["skewness"],
+                    feats["x"]["freqs"], feats["x"]["mag"],
+                    feats["y"]["rms"], feats["y"]["crest_factor"], feats["y"]["kurtosis"], feats["y"]["skewness"],
+                    feats["y"]["freqs"], feats["y"]["mag"],
+                    feats["z"]["rms"], feats["z"]["crest_factor"], feats["z"]["kurtosis"], feats["z"]["skewness"],
+                    feats["z"]["freqs"], feats["z"]["mag"],
+                ),
+            )
+            conn.commit()
+    except Exception as e:
+        conn.rollback()
+        raise HTTPException(status_code=500, detail=f"Insert failed: {e}")
+    finally:
+        db_pool.putconn(conn)
 
-    # "computed_stats" grows over time -- lightweight, used for the trend chart
-    db.collection("computed_stats").add(stats_row)
-
-    return {"status": "ok", "label": label, "trial": trial}
+    return {"status": "ok", "device_id": batch.device_id, **session}
 
 
 @app.get("/latest")
-def latest():
-    if db is None:
-        raise HTTPException(status_code=503, detail="Firebase not configured")
-    doc = db.collection("latest").document("reading").get()
-    if not doc.exists:
-        raise HTTPException(status_code=404, detail="No data yet -- has the ESP32 sent a batch?")
-    data = doc.to_dict()
-    data["timestamp"] = data["timestamp"].isoformat()
-    return data
+def latest(device_id: str):
+    conn = get_conn()
+    try:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute(
+                "SELECT * FROM readings WHERE device_id = %s ORDER BY time DESC LIMIT 1",
+                (device_id,),
+            )
+            row = cur.fetchone()
+    finally:
+        db_pool.putconn(conn)
+
+    if not row:
+        raise HTTPException(status_code=404, detail=f"No data yet for device '{device_id}'")
+
+    row = dict(row)
+    result = {
+        "timestamp": row["time"].isoformat(),
+        "sample_rate": row["sample_rate"],
+        "label": row["label"],
+        "trial": row["trial"],
+    }
+    for axis in ["x", "y", "z"]:
+        raw_adc = np.array(row[f"{axis}_raw"], dtype=float)
+        # AC-only (mean-subtracted) waveform in g -- shows vibration fluctuation,
+        # not absolute tilt, so it doesn't require knowing this unit's exact
+        # zero-g offset voltage (which isn't calibrated per-device here).
+        raw_g = ((raw_adc - raw_adc.mean()) * ADC_TO_G).round(5).tolist()
+        result[axis] = {
+            "raw": raw_g,
+            "rms": row[f"{axis}_rms"],
+            "crest_factor": row[f"{axis}_crest"],
+            "kurtosis": row[f"{axis}_kurtosis"],
+            "skewness": row[f"{axis}_skewness"],
+            "spectrum_freqs": row[f"{axis}_spectrum_freqs"],
+            "spectrum_mag": row[f"{axis}_spectrum_mag"],
+        }
+    return result
 
 
 @app.get("/history")
-def history(limit: int = 50):
-    if db is None:
-        raise HTTPException(status_code=503, detail="Firebase not configured")
-    docs = (
-        db.collection("computed_stats")
-        .order_by("timestamp", direction=firestore.Query.DESCENDING)
-        .limit(limit)
-        .stream()
-    )
-    rows = []
-    for doc in docs:
-        d = doc.to_dict()
-        rows.append({
-            "timestamp": d["timestamp"].isoformat(),
-            "rms_x": d.get("rms_x"),
-            "rms_y": d.get("rms_y"),
-            "rms_z": d.get("rms_z"),
-            "label": d.get("label", "unlabeled"),
-            "trial": d.get("trial", 0),
-        })
-    rows.reverse()
-    return rows
+def history(device_id: str, limit: int = 30):
+    conn = get_conn()
+    try:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute(
+                """
+                SELECT time, x_rms, y_rms, z_rms, label, trial
+                FROM readings WHERE device_id = %s
+                ORDER BY time DESC LIMIT %s
+                """,
+                (device_id, limit),
+            )
+            rows = cur.fetchall()
+    finally:
+        db_pool.putconn(conn)
+
+    result = [
+        {
+            "timestamp": r["time"].isoformat(),
+            "rms_x": r["x_rms"],
+            "rms_y": r["y_rms"],
+            "rms_z": r["z_rms"],
+            "label": r["label"],
+            "trial": r["trial"],
+        }
+        for r in rows
+    ]
+    result.reverse()
+    return result
+
+
+@app.get("/devices")
+def list_devices():
+    conn = get_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT DISTINCT device_id FROM readings ORDER BY device_id")
+            rows = cur.fetchall()
+    finally:
+        db_pool.putconn(conn)
+    return [r[0] for r in rows]
