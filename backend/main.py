@@ -81,12 +81,37 @@ def compute_features(signal):
     rms = float(np.sqrt(np.mean(sig_ac ** 2)))
     peak = float(np.max(np.abs(sig_ac)))
     crest = peak / rms if rms > 0 else 0.0
+    # kurtosis/skewness are mathematically undefined (NaN, div-by-zero variance)
+    # for a perfectly constant signal -- e.g. a stuck sensor or a mock batch that
+    # forgot to add noise on one axis. Guard explicitly rather than letting NaN
+    # crash JSON serialization downstream.
+    if rms > 1e-9:
+        kurt = float(kurtosis(sig_ac))
+        sk = float(skew(sig_ac))
+    else:
+        kurt = 0.0
+        sk = 0.0
     return {
         "rms": rms,  # g
         "crest_factor": crest,  # dimensionless (scale-invariant, unaffected by calibration)
-        "kurtosis": float(kurtosis(sig_ac)),  # dimensionless
-        "skewness": float(skew(sig_ac)),  # dimensionless
+        "kurtosis": kurt,  # dimensionless
+        "skewness": sk,  # dimensionless
     }
+
+
+def sanitize_json(obj):
+    """Recursively replace NaN/Inf with None so json.dumps never crashes on them.
+    Defense-in-depth on top of the compute_features guard above -- catches any
+    other numerically-degenerate case that might slip through."""
+    if isinstance(obj, float):
+        if obj != obj or obj in (float("inf"), float("-inf")):  # obj != obj is the NaN check
+            return None
+        return obj
+    if isinstance(obj, dict):
+        return {k: sanitize_json(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [sanitize_json(v) for v in obj]
+    return obj
 
 
 @app.get("/")
@@ -218,7 +243,7 @@ def latest(device_id: str):
                 "spectrum_freqs": row[f"{axis}_spectrum_freqs"],
                 "spectrum_mag": row[f"{axis}_spectrum_mag"],
             }
-        return result
+        return sanitize_json(result)
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed formatting response for device '{device_id}': {e}")
 
@@ -258,7 +283,7 @@ def history(device_id: str, limit: int = 30):
         for r in rows
     ]
     result.reverse()
-    return result
+    return sanitize_json(result)
 
 
 @app.get("/devices")
