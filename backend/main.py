@@ -37,7 +37,7 @@ app.add_middleware(
 # Set env var DATABASE_URL on Render to your Timescale Cloud connection string,
 # e.g. postgresql://user:pass@host:port/dbname?sslmode=require
 DATABASE_URL = os.environ.get("DATABASE_URL")
-db_pool = psycopg2.pool.SimpleConnectionPool(1, 10, DATABASE_URL) if DATABASE_URL else None
+db_pool = psycopg2.pool.SimpleConnectionPool(1, 20, DATABASE_URL) if DATABASE_URL else None
 
 FaultLabel = Literal["normal", "bpfo", "bpfi", "ftf", "bsf", "monitoring"]
 
@@ -89,12 +89,6 @@ def compute_features(signal):
     }
 
 
-def get_conn():
-    if db_pool is None:
-        raise HTTPException(status_code=503, detail="Database not configured")
-    return db_pool.getconn()
-
-
 @app.get("/")
 def root():
     return {"status": "backend running", "db_connected": db_pool is not None}
@@ -102,8 +96,11 @@ def root():
 
 @app.post("/session/start")
 def start_session(device_id: str, label: FaultLabel):
-    conn = get_conn()
+    if db_pool is None:
+        raise HTTPException(status_code=503, detail="Database not configured")
+    conn = None
     try:
+        conn = db_pool.getconn()
         with conn.cursor() as cur:
             cur.execute(
                 "SELECT COALESCE(MAX(trial), 0) FROM readings WHERE device_id = %s AND label = %s",
@@ -111,9 +108,10 @@ def start_session(device_id: str, label: FaultLabel):
             )
             max_trial = cur.fetchone()[0]
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Database query failed (check for a missing index/table): {e}")
+        raise HTTPException(status_code=500, detail=f"Database query failed (check for a missing index/table, or connection pool exhaustion): {e}")
     finally:
-        db_pool.putconn(conn)
+        if conn is not None:
+            db_pool.putconn(conn)
 
     _current_sessions[device_id] = {"label": label, "trial": max_trial + 1}
     return {"status": "ok", "device_id": device_id, **_current_sessions[device_id]}
@@ -134,8 +132,11 @@ def ingest(batch: Batch):
         freqs, mag = compute_fft(data, batch.sample_rate)
         feats[axis] = {**f, "freqs": freqs, "mag": mag}
 
-    conn = get_conn()
+    if db_pool is None:
+        raise HTTPException(status_code=503, detail="Database not configured")
+    conn = None
     try:
+        conn = db_pool.getconn()
         with conn.cursor() as cur:
             cur.execute(
                 """
@@ -162,18 +163,23 @@ def ingest(batch: Batch):
             )
             conn.commit()
     except Exception as e:
-        conn.rollback()
-        raise HTTPException(status_code=500, detail=f"Insert failed: {e}")
+        if conn is not None:
+            conn.rollback()
+        raise HTTPException(status_code=500, detail=f"Insert failed (check for connection pool exhaustion): {e}")
     finally:
-        db_pool.putconn(conn)
+        if conn is not None:
+            db_pool.putconn(conn)
 
     return {"status": "ok", "device_id": batch.device_id, **session}
 
 
 @app.get("/latest")
 def latest(device_id: str):
-    conn = get_conn()
+    if db_pool is None:
+        raise HTTPException(status_code=503, detail="Database not configured")
+    conn = None
     try:
+        conn = db_pool.getconn()
         with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
             cur.execute(
                 "SELECT * FROM readings WHERE device_id = %s ORDER BY time DESC LIMIT 1",
@@ -181,9 +187,10 @@ def latest(device_id: str):
             )
             row = cur.fetchone()
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Query failed for device '{device_id}': {e}")
+        raise HTTPException(status_code=500, detail=f"Query failed for device '{device_id}' (check for connection pool exhaustion): {e}")
     finally:
-        db_pool.putconn(conn)
+        if conn is not None:
+            db_pool.putconn(conn)
 
     if not row:
         raise HTTPException(status_code=404, detail=f"No data yet for device '{device_id}'")
@@ -218,8 +225,11 @@ def latest(device_id: str):
 
 @app.get("/history")
 def history(device_id: str, limit: int = 30):
-    conn = get_conn()
+    if db_pool is None:
+        raise HTTPException(status_code=503, detail="Database not configured")
+    conn = None
     try:
+        conn = db_pool.getconn()
         with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
             cur.execute(
                 """
@@ -231,9 +241,10 @@ def history(device_id: str, limit: int = 30):
             )
             rows = cur.fetchall()
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Query failed for device '{device_id}': {e}")
+        raise HTTPException(status_code=500, detail=f"Query failed for device '{device_id}' (check for connection pool exhaustion): {e}")
     finally:
-        db_pool.putconn(conn)
+        if conn is not None:
+            db_pool.putconn(conn)
 
     result = [
         {
@@ -252,13 +263,17 @@ def history(device_id: str, limit: int = 30):
 
 @app.get("/devices")
 def list_devices():
-    conn = get_conn()
+    if db_pool is None:
+        raise HTTPException(status_code=503, detail="Database not configured")
+    conn = None
     try:
+        conn = db_pool.getconn()
         with conn.cursor() as cur:
             cur.execute("SELECT DISTINCT device_id FROM readings ORDER BY device_id")
             rows = cur.fetchall()
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Query failed: {e}")
+        raise HTTPException(status_code=500, detail=f"Query failed (check for connection pool exhaustion): {e}")
     finally:
-        db_pool.putconn(conn)
+        if conn is not None:
+            db_pool.putconn(conn)
     return [r[0] for r in rows]
