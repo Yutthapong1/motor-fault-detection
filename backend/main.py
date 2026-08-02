@@ -180,35 +180,40 @@ def latest(device_id: str):
                 (device_id,),
             )
             row = cur.fetchone()
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Query failed for device '{device_id}': {e}")
     finally:
         db_pool.putconn(conn)
 
     if not row:
         raise HTTPException(status_code=404, detail=f"No data yet for device '{device_id}'")
 
-    row = dict(row)
-    result = {
-        "timestamp": row["time"].isoformat(),
-        "sample_rate": row["sample_rate"],
-        "label": row["label"],
-        "trial": row["trial"],
-    }
-    for axis in ["x", "y", "z"]:
-        raw_adc = np.array(row[f"{axis}_raw"], dtype=float)
-        # AC-only (mean-subtracted) waveform in g -- shows vibration fluctuation,
-        # not absolute tilt, so it doesn't require knowing this unit's exact
-        # zero-g offset voltage (which isn't calibrated per-device here).
-        raw_g = ((raw_adc - raw_adc.mean()) * ADC_TO_G).round(5).tolist()
-        result[axis] = {
-            "raw": raw_g,
-            "rms": row[f"{axis}_rms"],
-            "crest_factor": row[f"{axis}_crest"],
-            "kurtosis": row[f"{axis}_kurtosis"],
-            "skewness": row[f"{axis}_skewness"],
-            "spectrum_freqs": row[f"{axis}_spectrum_freqs"],
-            "spectrum_mag": row[f"{axis}_spectrum_mag"],
+    try:
+        row = dict(row)
+        result = {
+            "timestamp": row["time"].isoformat(),
+            "sample_rate": row["sample_rate"],
+            "label": row["label"],
+            "trial": row["trial"],
         }
-    return result
+        for axis in ["x", "y", "z"]:
+            raw_adc = np.array(row[f"{axis}_raw"], dtype=float)
+            # AC-only (mean-subtracted) waveform in g -- shows vibration fluctuation,
+            # not absolute tilt, so it doesn't require knowing this unit's exact
+            # zero-g offset voltage (which isn't calibrated per-device here).
+            raw_g = ((raw_adc - raw_adc.mean()) * ADC_TO_G).round(5).tolist()
+            result[axis] = {
+                "raw": raw_g,
+                "rms": row[f"{axis}_rms"],
+                "crest_factor": row[f"{axis}_crest"],
+                "kurtosis": row[f"{axis}_kurtosis"],
+                "skewness": row[f"{axis}_skewness"],
+                "spectrum_freqs": row[f"{axis}_spectrum_freqs"],
+                "spectrum_mag": row[f"{axis}_spectrum_mag"],
+            }
+        return result
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed formatting response for device '{device_id}': {e}")
 
 
 @app.get("/history")
@@ -225,6 +230,8 @@ def history(device_id: str, limit: int = 30):
                 (device_id, limit),
             )
             rows = cur.fetchall()
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Query failed for device '{device_id}': {e}")
     finally:
         db_pool.putconn(conn)
 
@@ -250,6 +257,8 @@ def list_devices():
         with conn.cursor() as cur:
             cur.execute("SELECT DISTINCT device_id FROM readings ORDER BY device_id")
             rows = cur.fetchall()
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Query failed: {e}")
     finally:
         db_pool.putconn(conn)
     return [r[0] for r in rows]
