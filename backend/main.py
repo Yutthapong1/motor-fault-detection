@@ -289,7 +289,7 @@ def history(device_id: str, limit: int = 30):
 
 
 @app.get("/sessions")
-def get_sessions(device_id: Optional[str] = None, label: Optional[FaultLabel] = None):
+def get_sessions(device_id: Optional[str] = None, label: Optional[str] = None):
     """
     Day-grouped list of recorded sessions across ALL devices, for the
     dashboard's History page. One row per (day, device_id, label, trial) =
@@ -354,13 +354,17 @@ def get_sessions(device_id: Optional[str] = None, label: Optional[FaultLabel] = 
 
 
 @app.get("/sessions/detail")
-def get_session_detail(device_id: str, label: FaultLabel, trial: int):
+def get_session_detail(device_id: str, label: str, trial: int):
     """
     One representative reading for a specific session, returned in the SAME
     shape as /latest (per-axis raw/rms/crest_factor/kurtosis/skewness/spectrum
     plus top-level sample_rate) so the dashboard's <SignalAnalysisPage> can
     render it completely unchanged -- History just fetches this and passes
     it in as the `latest` prop instead of the live reading.
+
+    `label` is a plain str, not FaultLabel -- readings ingested with no
+    active session fall back to label="unlabeled" (see /ingest), which
+    isn't in that enum. Constraining it here 422'd on exactly that case.
 
     Picks the batch with the highest combined RMS in the session (the most
     "interesting" moment) rather than the first or last in time.
