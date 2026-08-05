@@ -9,12 +9,14 @@ Endpoints:
   POST /ingest            - ESP32 posts a batch here (must include device_id)
   GET  /latest             - latest reading for one device
   GET  /history            - RMS trend for one device
+  GET  /sessions            - day-grouped session list across all devices (History page)
+  GET  /sessions/detail    - one representative reading for a specific session, shaped like /latest
   GET  /devices            - list all device_ids seen so far
   GET  /                   - health check
 """
 
 import os
-from typing import List, Literal
+from typing import List, Literal, Optional
 
 import numpy as np
 import psycopg2
@@ -284,6 +286,135 @@ def history(device_id: str, limit: int = 30):
     ]
     result.reverse()
     return sanitize_json(result)
+
+
+@app.get("/sessions")
+def get_sessions(device_id: Optional[str] = None, label: Optional[FaultLabel] = None):
+    """
+    Day-grouped list of recorded sessions across ALL devices, for the
+    dashboard's History page. One row per (day, device_id, label, trial) =
+    one "session card" in the UI. Optional filters: device_id, label.
+    Named /sessions (not /history) to avoid colliding with the endpoint
+    above, which is a different, single-device, RMS-trend query.
+
+    Groups by Asia/Bangkok calendar day (the dashboard shows Thai dates) --
+    change the AT TIME ZONE literal if that assumption is wrong. A session
+    that runs past midnight Bangkok time will be split into two day-cards;
+    acceptable for this scope, not handled.
+    """
+    if db_pool is None:
+        raise HTTPException(status_code=503, detail="Database not configured")
+    conn = None
+    try:
+        conn = db_pool.getconn()
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute(
+                """
+                SELECT
+                    date_trunc('day', time AT TIME ZONE 'Asia/Bangkok') AS day,
+                    device_id,
+                    label,
+                    trial,
+                    MIN(time) AS start_time,
+                    MAX(time) AS end_time,
+                    COUNT(*) AS batch_count,
+                    AVG(x_rms) AS avg_x_rms,
+                    AVG(y_rms) AS avg_y_rms,
+                    AVG(z_rms) AS avg_z_rms
+                FROM readings
+                WHERE (%(device_id)s::text IS NULL OR device_id = %(device_id)s)
+                  AND (%(label)s::text IS NULL OR label = %(label)s)
+                GROUP BY day, device_id, label, trial
+                ORDER BY day DESC, start_time DESC
+                """,
+                {"device_id": device_id, "label": label},
+            )
+            rows = cur.fetchall()
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Query failed (check for connection pool exhaustion): {e}")
+    finally:
+        if conn is not None:
+            db_pool.putconn(conn)
+
+    days = {}
+    for r in rows:
+        r = dict(r)
+        day_key = r["day"].date().isoformat()
+        days.setdefault(day_key, []).append({
+            "device_id": r["device_id"],
+            "label": r["label"],
+            "trial": r["trial"],
+            "start_time": r["start_time"].isoformat(),
+            "end_time": r["end_time"].isoformat(),
+            "batch_count": r["batch_count"],
+            "avg_rms": {"x": r["avg_x_rms"], "y": r["avg_y_rms"], "z": r["avg_z_rms"]},
+        })
+
+    return sanitize_json({"days": [{"date": d, "sessions": s} for d, s in sorted(days.items(), reverse=True)]})
+
+
+@app.get("/sessions/detail")
+def get_session_detail(device_id: str, label: FaultLabel, trial: int):
+    """
+    One representative reading for a specific session, returned in the SAME
+    shape as /latest (per-axis raw/rms/crest_factor/kurtosis/skewness/spectrum
+    plus top-level sample_rate) so the dashboard's <SignalAnalysisPage> can
+    render it completely unchanged -- History just fetches this and passes
+    it in as the `latest` prop instead of the live reading.
+
+    Picks the batch with the highest combined RMS in the session (the most
+    "interesting" moment) rather than the first or last in time.
+    """
+    if db_pool is None:
+        raise HTTPException(status_code=503, detail="Database not configured")
+    conn = None
+    try:
+        conn = db_pool.getconn()
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute(
+                """
+                SELECT * FROM readings
+                WHERE device_id = %s AND label = %s AND trial = %s
+                ORDER BY (COALESCE(x_rms, 0) + COALESCE(y_rms, 0) + COALESCE(z_rms, 0)) DESC
+                LIMIT 1
+                """,
+                (device_id, label, trial),
+            )
+            row = cur.fetchone()
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Query failed for device '{device_id}' (check for connection pool exhaustion): {e}")
+    finally:
+        if conn is not None:
+            db_pool.putconn(conn)
+
+    if not row:
+        raise HTTPException(status_code=404, detail=f"No data for device '{device_id}', label '{label}', trial {trial}")
+
+    try:
+        row = dict(row)
+        result = {
+            "timestamp": row["time"].isoformat(),
+            "sample_rate": row["sample_rate"],
+            "label": row["label"],
+            "trial": row["trial"],
+        }
+        for axis in ["x", "y", "z"]:
+            raw_adc = np.array(row[f"{axis}_raw"], dtype=float)
+            # Same AC-only (mean-subtracted) g conversion as /latest -- keeps
+            # the waveform shape identical to what SignalAnalysisPage expects.
+            raw_g = ((raw_adc - raw_adc.mean()) * ADC_TO_G).round(5).tolist()
+            result[axis] = {
+                "raw": raw_g,
+                "rms": row[f"{axis}_rms"],
+                "crest_factor": row[f"{axis}_crest"],
+                "kurtosis": row[f"{axis}_kurtosis"],
+                "skewness": row[f"{axis}_skewness"],
+                "spectrum_freqs": row[f"{axis}_spectrum_freqs"],
+                "spectrum_mag": row[f"{axis}_spectrum_mag"],
+            }
+        return sanitize_json(result)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed formatting response for device '{device_id}': {e}")
 
 
 @app.get("/devices")
