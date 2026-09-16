@@ -275,6 +275,104 @@ def latest(device_id: str):
         raise HTTPException(status_code=500, detail=f"Failed formatting response for device '{device_id}': {e}")
 
 
+@app.get("/latest/averaged")
+def latest_averaged(device_id: str, n: int = 5):
+    """
+    Like /latest, but the SPECTRUM is averaged across the n most recent
+    readings for this device that share the most recent one's label (so a
+    recent label switch, e.g. normal -> bpfo, doesn't blend two different
+    physical conditions together). The time waveform and scalar features
+    (rms/crest/kurtosis/skewness) are still from the single latest reading
+    only -- averaging those wouldn't mean the same thing, so this only
+    smooths the thing that was actually noisy: the per-reading spectrum.
+
+    Averages POWER (magnitude squared) across readings, then takes the square
+    root -- the standard way to average magnitude spectra (this is
+    Bartlett's/Welch's method for PSD estimation). Averaging the magnitudes
+    directly would be a slight understatement of the result, since sqrt() is
+    concave (Jensen's inequality) -- mean(sqrt(x)) <= sqrt(mean(x)).
+
+    Each axis reports how many readings actually went into its average
+    (`averaged_over`) -- normally n, but fewer right after a session start,
+    or if a stray reading has a mismatched spectrum length (e.g. from a
+    different sample_rate/BATCH_SIZE) and gets skipped rather than corrupting
+    the average.
+    """
+    pool = get_db_pool()
+    if pool is None:
+        raise HTTPException(status_code=503, detail="Database not configured")
+    conn = None
+    try:
+        conn = pool.getconn()
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute(
+                "SELECT * FROM readings WHERE device_id = %s ORDER BY time DESC LIMIT 1",
+                (device_id,),
+            )
+            latest_row = cur.fetchone()
+            if not latest_row:
+                raise HTTPException(status_code=404, detail=f"No data yet for device '{device_id}'")
+            cur.execute(
+                """
+                SELECT time, x_spectrum_mag, y_spectrum_mag, z_spectrum_mag
+                FROM readings
+                WHERE device_id = %s AND label = %s
+                ORDER BY time DESC LIMIT %s
+                """,
+                (device_id, latest_row["label"], n),
+            )
+            spec_rows = cur.fetchall()
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Query failed for device '{device_id}' (check for connection pool exhaustion): {e}")
+    finally:
+        if conn is not None:
+            pool.putconn(conn)
+
+    latest_row = dict(latest_row)
+    spec_rows = [dict(r) for r in spec_rows]
+
+    try:
+        result = {
+            "timestamp": latest_row["time"].isoformat(),
+            "sample_rate": latest_row["sample_rate"],
+            "label": latest_row["label"],
+            "trial": latest_row["trial"],
+        }
+        for axis in ["x", "y", "z"]:
+            raw_adc = np.array(latest_row[f"{axis}_raw"], dtype=float)
+            raw_g = ((raw_adc - raw_adc.mean()) * ADC_TO_G).round(5).tolist()
+
+            freqs = latest_row[f"{axis}_spectrum_freqs"]
+            expected_len = len(freqs)
+            mags = [
+                np.array(r[f"{axis}_spectrum_mag"], dtype=float)
+                for r in spec_rows
+                if r[f"{axis}_spectrum_mag"] is not None and len(r[f"{axis}_spectrum_mag"]) == expected_len
+            ]
+            if not mags:
+                # Nothing else matched this axis's spectrum length -- fall back
+                # to the latest reading's own spectrum rather than erroring out.
+                mags = [np.array(latest_row[f"{axis}_spectrum_mag"], dtype=float)]
+            avg_power = np.mean(np.stack(mags) ** 2, axis=0)
+            avg_mag = np.sqrt(avg_power).round(6).tolist()
+
+            result[axis] = {
+                "raw": raw_g,
+                "rms": latest_row[f"{axis}_rms"],
+                "crest_factor": latest_row[f"{axis}_crest"],
+                "kurtosis": latest_row[f"{axis}_kurtosis"],
+                "skewness": latest_row[f"{axis}_skewness"],
+                "spectrum_freqs": freqs,
+                "spectrum_mag": avg_mag,
+                "averaged_over": len(mags),
+            }
+        return sanitize_json(result)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed formatting response for device '{device_id}': {e}")
+
+
 @app.get("/history")
 def history(device_id: str, limit: int = 30):
     pool = get_db_pool()
